@@ -14,7 +14,7 @@ class TranscriptEnrichments(models.Model):
     created_at = models.DateTimeField(blank=True, null=True)
 
     class Meta:
-        managed = False
+        managed = True
         db_table = 'transcript_enrichments'
 
 
@@ -26,7 +26,7 @@ class Transcripts(models.Model):
     created_at = models.DateTimeField(blank=True, null=True)
 
     class Meta:
-        managed = False
+        managed = True
         db_table = 'transcripts'
 
 
@@ -35,5 +35,5 @@ class Videos(models.Model):
     created_at = models.DateTimeField(blank=True, null=True)
 
     class Meta:
-        managed = False
+        managed = True
         db_table = 'videos'
