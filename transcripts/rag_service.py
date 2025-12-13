@@ -1,15 +1,51 @@
-from openai import OpenAI
-from .semantic_search import semantic_search
-from django.conf import settings
+"""RAG service - supports both local LM Studio and Vercel deployment."""
+
 import os
+from .semantic_search import semantic_search
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
-    base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-)
+# Detect environment
+IS_PRODUCTION = os.getenv('VERCEL_ENV') is not None
+
+if IS_PRODUCTION:
+    # Use groq for deployment
+    from groq import Groq
+    
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    LLM_MODEL = "llama-3.1-8b-instant"
+    
+    def generate_completion(messages: list) -> str:
+        """Generate answer using Groq API"""
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=512,
+        )
+        return response.choices[0].message.content
+
+else:
+    # Use LM Studio for local
+    from openai import OpenAI
+    
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
+        base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
+    )
+    LLM_MODEL = "openai/gpt-oss-20b"
+    
+    def generate_completion(messages: list) -> str:
+        """Generate answer using local LM Studio"""
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=512,
+        )
+        return response.choices[0].message.content
+
 
 def answer_question(question: str, video_id: str = None, conversation_history: list = None, top_k: int = 3) -> dict:
     """RAG Pipeline: Retrieve → Augment → Generate → Cite"""
@@ -19,7 +55,10 @@ def answer_question(question: str, video_id: str = None, conversation_history: l
     
     if 'error' in retrieval_result:
         if 'Failed to embed query' in retrieval_result['error']:
-            return {"error": "LM Studio Embedding model connection failed (Check RAG UI state)."}
+            if IS_PRODUCTION:
+                return {"error": "Hugging Face API connection failed. Check API key in Vercel environment variables."}
+            else:
+                return {"error": "LM Studio connection failed. Make sure LM Studio is running on port 1234."}
         return retrieval_result
 
     chunks = retrieval_result['results']
@@ -49,14 +88,7 @@ IMPORTANT RULES:
         messages = messages[:1] + conversation_history + messages[1:]
 
     try:
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b", 
-            messages=messages,
-            temperature=0.7,
-            max_tokens=512, 
-        )
-
-        answer = response.choices[0].message.content
+        answer = generate_completion(messages)
 
         # --- Step 4: CITATION TRACKING - Extract and format sources ---
         citations = []
@@ -75,13 +107,21 @@ IMPORTANT RULES:
 
         confidence = sum(similarity_scores) / len(similarity_scores) if similarity_scores else 0.0
 
+        model_info = f"{LLM_MODEL} ({'Groq API' if IS_PRODUCTION else 'LM Studio Local'})"
+
         return {
             "answer": answer,
             "sources": citations,
             "confidence": confidence,
-            "model": "openai/gpt-oss-20b"
+            "model": model_info,
+            "environment": "production" if IS_PRODUCTION else "local"
         }
 
     except Exception as e:
-        print(f"LLM generation failed in rag_service.py: {str(e)}")
-        return {"error": f"LLM generation failed: {str(e)}. Check LM Studio logs for /v1/chat/completions errors."}
+        error_context = "Groq API" if IS_PRODUCTION else "LM Studio"
+        print(f"LLM generation failed in rag_service.py ({error_context}): {str(e)}")
+        
+        if IS_PRODUCTION:
+            return {"error": f"Groq API failed: {str(e)}. Check GROQ_API_KEY in Vercel environment variables."}
+        else:
+            return {"error": f"LM Studio failed: {str(e)}. Check LM Studio logs for /v1/chat/completions errors."}

@@ -1,20 +1,54 @@
-"""Semantic search using pgvector cosine similarity."""
+"""Semantic search using pgvector - supports both local LM Studio and Vercel deployment."""
 
 import os
 import time
-from openai import OpenAI
+import requests
 from django.db import connection
-#from .models import Transcripts, Videos
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# OpenAI Client and Embedding
-EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-GGUF"
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
-    base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-)
+# Detect environment
+IS_PRODUCTION = os.getenv('VERCEL_ENV') is not None
+
+if IS_PRODUCTION:
+    # Use HF API for deployment
+    HF_API_KEY = os.getenv("HF_API_KEY")
+    HF_EMBEDDING_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+    
+    def get_embedding(text: str) -> list:
+        """Get embedding from Hugging Face API"""
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+        response = requests.post(
+            HF_EMBEDDING_URL, 
+            headers=headers, 
+            json={"inputs": text},
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"HF API error: {response.text}")
+        
+        return response.json()
+
+else:
+    # For Local (LM Studio)
+    from openai import OpenAI
+    
+    EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-GGUF"
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
+        base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
+    )
+    
+    def get_embedding(text: str) -> list:
+        """Get embedding from local LM Studio"""
+        query_response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
+        return query_response.data[0].embedding
+
 
 def semantic_search(query: str, video_id: str = None, top_k: int = 5) -> dict:
     """Find semantically similar transcripts using embeddings.
@@ -29,16 +63,17 @@ def semantic_search(query: str, video_id: str = None, top_k: int = 5) -> dict:
     """
     start_time = time.time()
 
-    # Step 1: Generate embedding for query
+    # Step 1: Generate embedding for query (auto-detects local vs production)
     try:
-        query_response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=query
-        )
-        query_embedding = query_response.data[0].embedding
+        query_embedding = get_embedding(query)
     except Exception as e:
+        error_msg = f'Failed to embed query: {str(e)}'
+        if IS_PRODUCTION:
+            error_msg += ' (Check Hugging Face API key in Vercel env)'
+        else:
+            error_msg += ' (Check LM Studio is running on port 1234)'
         return {
-            'error': f'Failed to embed query: {str(e)}',
+            'error': error_msg,
             'query': query
         }
 
@@ -62,7 +97,6 @@ def semantic_search(query: str, video_id: str = None, top_k: int = 5) -> dict:
         t.text,
         t.start_time_seconds,
         v.video_id as youtube_video_id,
-        
         1 - (t.embedding <-> %s::vector) as similarity_score
     FROM text_chunks t
     JOIN videos v ON t.video_id = v.video_id
@@ -96,7 +130,8 @@ def semantic_search(query: str, video_id: str = None, top_k: int = 5) -> dict:
             'query': query,
             'results_count': len(results),
             'execution_time_ms': execution_time,
-            'results': results
+            'results': results,
+            'environment': 'production (Hugging Face)' if IS_PRODUCTION else 'local (LM Studio)'
         }
 
     except Exception as e:
