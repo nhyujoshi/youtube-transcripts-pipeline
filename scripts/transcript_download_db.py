@@ -4,19 +4,48 @@ from googleapiclient.discovery import build
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import WebshareProxyConfig
 from youtube_transcript_api._errors import TranscriptsDisabled
+from youtube_transcript_api.formatters import WebVTTFormatter
 import psycopg2
 from psycopg2 import sql
 from dotenv import load_dotenv
 import random
 import time
+import threading
+import queue
 
 load_dotenv()
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "youtube_transcripts")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+if DATABASE_URL:
+    import re
+    from urllib.parse import urlparse, parse_qs
+    
+    # Parse the URL
+    parsed = urlparse(DATABASE_URL)
+    
+    DB_USER = parsed.username
+    DB_PASSWORD = parsed.password
+    DB_HOST = parsed.hostname
+    DB_PORT = parsed.port or 5432
+    DB_NAME = parsed.path.lstrip('/')
+    
+    print(f"✓ Using hosted database: {DB_HOST}")
+else:
+    # Local database
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = os.getenv("DB_PORT", "5432")
+    DB_NAME = os.getenv("DB_NAME", "youtube_transcripts")
+    DB_USER = os.getenv("DB_USER", "postgres")
+    DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# Number of concurrent threads
+PROCESSING_THREADS = 3
+
+# Thread-safe counter for progress tracking
+progress_lock = threading.Lock()
+completed_count = 0
+total_count = 0
 
 def get_playlist_details(api_build, next_page_token, plistID=""):
     request = api_build.playlistItems().list(
@@ -66,78 +95,141 @@ def get_video_transcripts(video_id):
         return fetched_transcript
         
     except TranscriptsDisabled:
-        print(f"Transcript is disabled for video {video_id}.")
+        print(f"✗ Transcript is disabled for video {video_id}.")
         return None
     except Exception as e:
-        print(f"Error fetching transcript for {video_id}: {e}")
+        print(f"✗ Error fetching transcript for {video_id}: {e}")
         return None
 
 def store_transcript(video_id, transcript):
     try:
         connection = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                database=DB_NAME,
-            )
-    except psycopg2.OperationalError as e:
-        print(f"Error connecting to database: {e}")
-        print("Please ensure your PostgreSQL server is running and your .env variables are correct.")
-        sys.exit(1)
-    cursor = connection.cursor()
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME,
+        )
+        cursor = connection.cursor()
 
-    # Insert video (if not exists)
-    cursor.execute(
-        """
-        INSERT INTO videos (video_id)
-        VALUES (%s)
-        ON CONFLICT (video_id) DO NOTHING
-        """,
-        (video_id,)
-    )
+        # Insert video (if not exists)
+        cursor.execute(
+            """
+            INSERT INTO videos (video_id)
+            VALUES (%s)
+            ON CONFLICT (video_id) DO NOTHING
+            """,
+            (video_id,)
+        )
 
-    # Insert transcript entries
-    transcript_data = [
+        # Insert transcript entries
+        transcript_data = [
             (video_id, each["text"], each["start"], each["duration"])
             for each in transcript
         ]
-    
-    insert_query = """
+        
+        insert_query = """
             INSERT INTO transcripts (video_id, text, start_time, duration)
             VALUES (%s, %s, %s, %s)
             """
-    cursor.executemany(insert_query, transcript_data)
+        cursor.executemany(insert_query, transcript_data)
 
-    connection.commit()
-    cursor.close()
-    connection.close()
+        connection.commit()
+        cursor.close()
+        connection.close()
+        return True
+        
+    except Exception as db_e:
+        print(f"✗ Database error storing {video_id}: {db_e}")
+        return False
+
+def process_video(video_id):
+    """Process a single video: fetch transcript and store in DB"""
+    global completed_count
+    
+    # Fetch transcript
+    transcript_data = get_video_transcripts(video_id)
+    
+    if transcript_data:
+        transcript_list = transcript_data.get(video_id, [])
+        if transcript_list:
+            # Store in database
+            success = store_transcript(video_id, transcript_list)
+            
+            if success:
+                with progress_lock:
+                    completed_count += 1
+                    print(f"✓ [{completed_count}/{total_count}] Successfully processed {video_id} ({len(transcript_list)} snippets)")
+                return True
+            else:
+                print(f"✗ Failed to store {video_id}")
+                return False
+        else:
+            print(f"✗ Empty transcript data for {video_id}")
+            return False
+    else:
+        print(f"✗ Could not fetch transcript for {video_id}")
+        return False
+    
+    return False
+
+def process_from_queue(q):
+    """Worker function that processes videos from the queue"""
+    while True:
+        try:
+            # Get video_id from queue with timeout
+            video_id = q.get(timeout=1)
+            
+            # Process the video
+            process_video(video_id)
+            
+            # Add random delay to avoid rate limiting
+            delay = random.uniform(2, 5)
+            time.sleep(delay)
+            
+            # Mark task as done
+            q.task_done()
+            
+        except queue.Empty:
+            # Queue is empty, exit thread
+            break
+        except Exception as e:
+            print(f"✗ Error in worker thread: {e}")
+            q.task_done()
 
 def main():
-    video_ids = get_video_ids("PLlrATfBNZ98cpX2LuxLnLyLEmfD2FPpRA")
-    print(f"Found {len(video_ids)} videos. Starting transcript fetch...")
+    global total_count
+    
+    # Fetch all video IDs from playlist
+    print("Fetching video IDs from playlist...")
+    video_ids = get_video_ids("PLZHQObOWTQDNU6R1_67000Dx_ZCJB-3pi")
+    total_count = len(video_ids)
+    print(f"Found {total_count} videos. Starting transcript fetch with {PROCESSING_THREADS} threads...\n")
 
-    for i, vid_id in enumerate(video_ids):
-        print(f"\n[{i+1}/{len(video_ids)}] Processing video ID: {vid_id}")
-        
-        transcript_data = get_video_transcripts(vid_id)
-        
-        if transcript_data:
-            transcript_list = transcript_data.get(vid_id, [])
-            if transcript_list:
-                print(f"Successfully fetched {len(transcript_list)} snippets.")
-                
-                try:
-                    store_transcript(vid_id, transcript_list)
-                    print(f"Successfully stored transcript for {vid_id}.")
-                except Exception as db_e:
-                    print(f"Database error storing {vid_id}: {db_e}")
-            else:
-                print(f"Transcript data was empty for {vid_id}.")
-        
-        delay = random.uniform(5, 15)
-        print(f"Pausing for {delay:.2f} seconds to avoid rate limiting...")
-        time.sleep(delay)
+    # Create queue and add all video IDs
+    q = queue.Queue()
+    for video_id in video_ids:
+        q.put(video_id)
+
+    # Create and start worker threads
+    threads = []
+    for i in range(PROCESSING_THREADS):
+        t = threading.Thread(target=lambda: process_from_queue(q), name=f"Worker-{i+1}")
+        t.daemon = True  # Thread will exit when main program exits
+        t.start()
+        threads.append(t)
+        print(f"Started thread: Worker-{i+1}")
+
+    # Wait for all tasks to complete
+    q.join()
+    
+    # Wait for all threads to finish
+    for t in threads:
+        t.join()
+
+    print(f"\n{'='*50}")
+    print(f"Processing complete! Successfully processed {completed_count}/{total_count} videos.")
+    print(f"{'='*50}")
 
 if __name__ == "__main__":
     main()
