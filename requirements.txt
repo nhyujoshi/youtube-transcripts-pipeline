@@ -9,5 +9,3 @@ google-api-python-client==2.187.0
 dj-database-url
 pgvector
 openai
-groq
-requests
